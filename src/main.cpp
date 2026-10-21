@@ -1,53 +1,26 @@
+// Port of Sbtias/gdinput for iOS: the F6 keyboard hook is replaced by a mod setting.
+// Behavior is otherwise unchanged. Credit: original mod by Sbtias.
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <deque>
 
 using namespace geode::prelude;
 
 namespace gdinput {
-    struct Stage {
-        int bufferTicks;
-        int waveTicks;
-    };
+    // Buffer window in physics ticks (240 ticks = 1 second). 0 = off.
+    inline int bufferTicks = 0;
 
-    // At 240 physics ticks per second, 32 ticks is about 133 ms.
-    // These are input-buffer windows, not artificial input delays.
-    constexpr Stage STAGES[] = {
-        {4, 0},
-        {8, 0},
-        {16, 0},
-        {32, 0}
-    };
-    constexpr int OFF = 4;
-    inline int stage = 0;
+    inline int ticksForStage(std::string const& s) {
+        if (s.starts_with("NOOB"))        return 4;
+        if (s.starts_with("PRO"))         return 8;
+        if (s.starts_with("BEST MODE+"))  return 32;
+        if (s.starts_with("BEST MODE"))   return 16;
+        return 0; // OFF
+    }
 
     inline bool verbose() {
         return Mod::get()->getSettingValue<bool>("verbose-log");
-    }
-
-    inline void showStage() {
-        if (stage == OFF) {
-            log::info("[GDInput] Jump buffer OFF");
-            Notification::create("GDInput  |  OFF", NotificationIcon::Info)->show();
-            return;
-        }
-
-        const auto s = STAGES[stage];
-        const char* names[] = { "NOOB", "PRO", "BEST MODE", "BEST MODE +" };
-        const char* descriptions[] = {
-            "4-tick jump buffer",
-            "8-tick jump buffer",
-            "16-tick jump buffer",
-            "32-tick jump buffer"
-        };
-
-        log::info("[GDInput] {}: {}-tick jump buffer", names[stage], s.bufferTicks);
-        Notification::create(
-            fmt::format("GDInput  |  {}\n{}", names[stage], descriptions[stage]),
-            NotificationIcon::Success
-        )->show();
     }
 }
 
@@ -69,7 +42,7 @@ class $modify(GDInputBaseLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         auto* fields = m_fields.self();
 
-        if (fields->applying || gdinput::stage == gdinput::OFF ||
+        if (fields->applying || gdinput::bufferTicks <= 0 ||
             button != GDINPUT_JUMP_BUTTON) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
@@ -81,8 +54,6 @@ class $modify(GDInputBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // If a jump press is already waiting for landing, remember the release
-        // but don't send a release for a press the game has not received yet.
         auto pending = fields->pendingJumps.end();
         for (auto it = fields->pendingJumps.begin(); it != fields->pendingJumps.end(); ++it) {
             if (it->player1 == isPlayer1) {
@@ -93,26 +64,20 @@ class $modify(GDInputBaseLayer, GJBaseGameLayer) {
 
         if (!down && pending != fields->pendingJumps.end()) {
             pending->released = true;
-            if (gdinput::verbose()) {
-                log::info("[GDInput] Remembered release for buffered jump");
-            }
+            if (gdinput::verbose()) log::info("[GDInput] Remembered release for buffered jump");
             return;
         }
 
-        // Only buffer an early jump press. Other buttons, including orbs and
-        // directional inputs, pass through immediately and keep their timing.
+        // Only buffer an early press while airborne (and not as wave).
         if (down && !player->m_isDart && !player->m_isOnGround) {
-            const int window = gdinput::STAGES[gdinput::stage].bufferTicks;
+            const int window = gdinput::bufferTicks;
             if (pending != fields->pendingJumps.end()) {
                 pending->remaining = window;
                 pending->released = false;
             } else {
                 fields->pendingJumps.push_back({isPlayer1, window, false});
             }
-
-            if (gdinput::verbose()) {
-                log::info("[GDInput] Buffered early jump for {} ticks", window);
-            }
+            if (gdinput::verbose()) log::info("[GDInput] Buffered early jump for {} ticks", window);
             return;
         }
 
@@ -130,7 +95,6 @@ class $modify(GDInputBaseLayer, GJBaseGameLayer) {
                 continue;
             }
 
-            // Execute the saved press as soon as the player reaches the ground.
             if (player->m_isOnGround && !player->m_isDart) {
                 const bool wasReleased = it->released;
                 const bool player1 = it->player1;
@@ -142,18 +106,14 @@ class $modify(GDInputBaseLayer, GJBaseGameLayer) {
                 }
                 fields->applying = false;
 
-                if (gdinput::verbose()) {
-                    log::info("[GDInput] Applied buffered jump on landing");
-                }
+                if (gdinput::verbose()) log::info("[GDInput] Applied buffered jump on landing");
                 it = fields->pendingJumps.erase(it);
                 continue;
             }
 
             --it->remaining;
             if (it->remaining <= 0) {
-                if (gdinput::verbose()) {
-                    log::info("[GDInput] Buffered jump expired");
-                }
+                if (gdinput::verbose()) log::info("[GDInput] Buffered jump expired");
                 it = fields->pendingJumps.erase(it);
             } else {
                 ++it;
@@ -174,17 +134,11 @@ class $modify(GDInputPlayLayer, PlayLayer) {
     }
 };
 
-class $modify(GDInputKeyboard, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double timestamp) {
-        if (down && !repeat && key == KEY_F6) {
-            gdinput::stage = (gdinput::stage + 1) % 5;
-            gdinput::showStage();
-            return true;
-        }
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
-    }
-};
-
 $on_mod(Loaded) {
-    log::info("[GDInput] Loaded. F6 cycles jump buffer windows: 4 -> 8 -> 16 -> 32 ticks -> OFF.");
+    gdinput::bufferTicks = gdinput::ticksForStage(
+        Mod::get()->getSettingValue<std::string>("stage"));
+    listenForSettingChanges<std::string>("stage", [](std::string value) {
+        gdinput::bufferTicks = gdinput::ticksForStage(value);
+        log::info("[GDInput] Buffer set to {} ticks", gdinput::bufferTicks);
+    });
 }
